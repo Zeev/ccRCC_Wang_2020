@@ -8,7 +8,6 @@ if (!require("BiocManager", quietly = TRUE))
   BiocManager::install("ComplexHeatmap")
   BiocManager::install("fgsea")
   BiocManager::install("biocLite")
-  n#library(org.Hs.eg.db)
 }
 library(svglite)
 library(umap)
@@ -26,40 +25,26 @@ library(tidyverse)
 library(survival)
 library(dplyr)
 library(tidyr)
-#library(DTUrtle)
-#library(tibble)
-# #remotes::install_github("TobiTekath/DTUrtle"), install git from its website, install dependencies from vignette
-# library(msigdbr)
-# library(ClassDiscovery)
-# library(Seurat)
-# #remotes::install_github("mojaveazure/seurat-object", "seurat5")
-# library(BisqueRNA)
-# library(VennDiagram)
- library(magick)
+library(magick)
 library(cowplot)
-#library("ggpubr")
-# library(grid)
- library(gridExtra)
-# library(M3C)
-# library (pheatmap)
-# library(RColorBrewer)
-# library(LW1949)
- library(stringr)
- library(readr)
+library(gridExtra)
+library(stringr)
+library(readr)
 library(rstatix)
-# library(rgl)
 
 tricolor <- c("#4575B4", "#FFFFBF", "#D73027")
 
-sigres <- function(res, padj_l = 0.01, l2fc_l = 1, indx=0) { #return significant result by p_limit and log_limit
-  ##Ex ## sigres(res, 0.01, 2, 1) 
+#input is Deseq's results, filter for genes with Log2FoldChange and P.Adg thresholds.
+#Use Index = 1 for the genes' index.
+sigres <- function(res, padj_l = 0.01, l2fc_l = 1, indx=0) {
+  ##Ex sigres(res, 0.01, 2, 1) 
   if (indx == 0) { 
     subset(res, padj<padj_l & abs(log2FoldChange)>l2fc_l)
   } else {
     which (res$padj < padj_l)[which(abs(res[which (res$padj < padj_l),][,"log2FoldChange"]) > l2fc_l)]
   }
-} #return list of significant results by threshold
-
+}
+#Volcano plot for Deseq's results
 EVplot <- function (myres){
   myVP<-EnhancedVolcano(myres,
                         lab = rownames(myres),
@@ -73,18 +58,19 @@ EVplot <- function (myres){
                         widthConnectors = 0.0)
   dev.new()
   print(myVP)
-} #volcano plot for results(dds) of deseq
+}
 
+#Calculate quantile breaks between 0 to 1
 quantile_breaks <- function(xs, n = 10) {
   breaks <- quantile(xs, probs = seq(0, 1, length.out = n), na.rm = TRUE)
   breaks[!duplicated(breaks)]
 }
-
+#Calculate quantile breaks between min to max
 quantile_breaks2 <- function(xs, n = 10) {
   breaks <- quantile(xs, probs = seq(min(xs), max(xs), length.out = n), na.rm = TRUE)
   breaks[!duplicated(breaks)]
 }
-
+#Scale matrix by rows
 scale_rows <- function(x){
   m = apply(x, 1, mean, na.rm = T)
   s = apply(x, 1, sd, na.rm = T)

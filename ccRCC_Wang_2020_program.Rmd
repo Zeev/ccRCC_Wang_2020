@@ -4,26 +4,22 @@ output:
   html_document:
     df_print: paged
 ---
-```{r, setup}
-#for 3d pca
-#knitr::knit_hooks$set(webgl = hook_webgl)
-```
 
- #Generate data frames 
- #RBP Feature plots 
- #RMATS pipeline 
- #Combined RMATS events 
- #Sashimi with feature 
- #RMAPS combined 
- #RMAPS with feature 
- #Ven diagram 
+ Generate data frames 
+ RBP Feature plots 
+ RMATS pipeline 
+ Combined RMATS events 
+ Sashimi with feature 
+ RMAPS combined 
+ RMAPS with feature 
+ Ven diagram 
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~CREATE DATA    V
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~Generate data frames    
 ```{r fig.height=15, fig.width=15, warning = FALSE, message = FALSE}
 source("ccRCC_Wang_2020_funcrtions.R")
 
 #create counts matrix using STAR results
-if (file.exists("Table counts.csv")){ctstk <- read.csv(file = "Table counts.csv", row.names = 1)
+if (file.exists("counts_ccRCC_wang_2020.csv")){cts <- read.csv(file = "Table counts.csv", row.names = 1)
 }else{ print('Counts file not found')}
 
 #create meta data table
@@ -33,19 +29,19 @@ meta <- meta_table_gen(meta_path = "Data from Wang et al/Table meta_build1.csv",
 rownames(meta) <- meta$Sample.Name
 
 #Change to Sample name instead of Run
-if (identical(meta[order(meta[,"Run"]), "Run"], colnames(ctstk)))
-{colnames(ctstk) <- meta[order(meta[, "Run"]), "Sample.Name"]}
+if (identical(meta[order(meta[,"Run"]), "Run"], colnames(cts)))
+{colnames(cts) <- meta[order(meta[, "Run"]), "Sample.Name"]}
 
 #sub-tables
-cts_c_t <- ctstk[,meta$State != "Normal"]
-cts_pt_tt <- ctstk[,meta$Thrombosis == "Yes"]
+cts_c_t <- cts[,meta$State != "Normal"]
+cts_pt_tt <- cts[,meta$Thrombosis == "Yes"]
 
 if(!exists("wrs_res"))
-{ wrs_res <- wrs_res_gen(ctstk, meta)} #Wilcoxon rank sum test for differential expressed genes
+{ wrs_res <- wrs_res_gen(cts, meta)} #Wilcoxon rank sum test for differential expressed genes
 
 annotation_color_list <- ann_colors() #for future heatmaps
 
-gene_lists <- gene_lists_gen(ctstk, wrs_res) #for pca and more
+gene_lists <- gene_lists_gen(cts, wrs_res) #for pca and more
 
 state_levels <- c('Normal','Cancer','Primary Tumor','Thrombus Tumor') #annotation
 
@@ -54,7 +50,7 @@ Ann_all <- meta[,c('sex','Age','T.stage','N.stage','M.stage','MayoLevel','State'
   
 if (!exists("dsq_normal_cancer"))
 {
-  dsq_normal_cancer <- DESeqDataSetFromMatrix(countData = ctstk,
+  dsq_normal_cancer <- DESeqDataSetFromMatrix(countData = cts,
                                               colData = meta,
                                               design= ~ Normal)
   dsq_normal_cancer <- DESeq(dsq_normal_cancer)
@@ -63,7 +59,7 @@ if (!exists("dsq_normal_cancer"))
   if(!file.exists("Table counts normalized.csv")){
     write.csv(cts_normal_cancer, file = "Table counts normalized.csv")}
   
-  dsq_nc_t <- DESeqDataSetFromMatrix(countData = ctstk,
+  dsq_nc_t <- DESeqDataSetFromMatrix(countData = cts,
                                               colData = meta,
                                               design= ~ Thrombosis)
   dsq_nc_t <- DESeq(dsq_nc_t)
@@ -769,7 +765,7 @@ ggsave(path3,width=32, height=16,
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~DESEQ PT-TT    V
 ```{r fig.width=15, fig.height=15}
-cts_pt_tt <- ctstk[,meta$Thrombosis == "Yes"]
+cts_pt_tt <- cts[,meta$Thrombosis == "Yes"]
 meta_pt_tt <- meta[meta$Thrombosis == "Yes", ]
 if(!exists("dsq_pt_tt"))
 {
