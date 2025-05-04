@@ -9,14 +9,14 @@ output:
 #knitr::knit_hooks$set(webgl = hook_webgl)
 ```
 
- Generate data frames 
- RBP Feature plots 
- RMATS pipeline 
- Combined RMATS events 
- Sashimi with feature 
- RMAPS combined 
- RMAPS with feature 
- Ven diagram 
+ #Generate data frames 
+ #RBP Feature plots 
+ #RMATS pipeline 
+ #Combined RMATS events 
+ #Sashimi with feature 
+ #RMAPS combined 
+ #RMAPS with feature 
+ #Ven diagram 
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~CREATE DATA    V
 ```{r fig.height=15, fig.width=15, warning = FALSE, message = FALSE}
