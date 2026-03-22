@@ -1,5 +1,5 @@
 ---
-title: "R Notebook"
+title: "ccRCC_Wang_2020"
 output:
   html_document:
     df_print: paged
@@ -14,40 +14,688 @@ output:
  RMAPS with feature 
  Ven diagram 
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~Generate data frames    
-```{r fig.height=15, fig.width=15, warning = FALSE, message = FALSE}
-source("ccRCC_Wang_2020_funcrtions.R")
+if (!require("BiocManager", quietly = TRUE))
+{
+  install.packages("BiocManager")
+  BiocManager::install("DESeq2")
+  BiocManager::install("edgeR")
+  BiocManager::install("EnhancedVolcano")
+  BiocManager::install("M3C")
+  BiocManager::install("ComplexHeatmap")
+  BiocManager::install("fgsea")
+  BiocManager::install("biocLite")
+}
+library(svglite)
+library(umap)
+library(Rtsne)
+library(edgeR)
+library(survminer)
+library(biomaRt)
+library(circlize)
+library(ComplexHeatmap)
+library(DESeq2)
+library(EnhancedVolcano)
+library(TCGAbiolinks)
+library(tidyverse)
+library(survival)
+library(dplyr)
+library(tidyr)
+library(magick)
+library(cowplot)
+library(gridExtra)
+library(stringr)
+library(readr)
+library(rstatix)
+~ Helper functions ~
 
-#create counts matrix using STAR results
-if (file.exists("counts_ccRCC_wang_2020.csv")){cts <- read.csv(file = "Table counts.csv", row.names = 1)
-}else{ print('Counts file not found')}
+formatC2 <- function(inclusion_level_o)
+{
+  x <- formatC(c(min(inclusion_level_o), median(inclusion_level_o) ,max(inclusion_level_o)), digits = 2, format = 'f')
+  sapply(x, function(i) if (i == '0.00') '0' else i)
+}
+         
+patient_state <- function (meta)
+{
+  (ifelse(meta$Normal == "Yes",
+          "Normal",(ifelse(meta$Thrombosis == "No", 
+                           "Cancer", ifelse(meta$State == "Cancer",
+                                            "Primary Tumor","Thrombus Tumor")))))
+}
+dist2 <- function(x1, x2) sqrt(sum((x1 - x2) ^ 2))
 
-#create meta data table
-meta <- meta_table_gen(meta_path = "Data from Wang et al/Table meta_build1.csv",
-                       meta_more_path = "Data from Wang et al/Table meta_build2.csv")
+color_hm_ann <- function(df,hm,rl1 = NULL, rl2 = NULL, cl1 = NULL, cl2 = NULL, h = 70, w = 20)
+{
+  df$colors <- ifelse(rownames(df) %in% rl1,"orangered",
+                         ifelse(rownames(df) %in% rl2,"royalblue","gray"))
+  cols=df[order(match(rownames(df), hm$gtable$grobs[[5]]$label)), ]$colors
+  hm$gtable$grobs[[6]]$gp=gpar(col=cols)
+  save_pheatmap_pdf(hm, paste0('plots/hm','.pdf'), width = w,height = h)
+}
+
+metadata_table <- function(meta_path_1, meta_path_2)
+{
+  meta_1 <- read.csv(meta_path_1, sep=',')
+  meta_1$Normal <-     ifelse( grepl("N",    meta_1$Sample.Name), "Yes", "No")
+  meta_1$Thrombosis <- ifelse( grepl("[c,t]",meta_1$Sample.Name), "Yes", "No")
+  meta_1$State <- "Normal"
+  meta_1$State [meta_1$Normal == "No" ] <- "Cancer"
+  meta_1$State [grepl("t",meta_1$Sample.Name)] <- "Thrombus"
+  meta_1$Weird <- ifelse(grepl("R",    meta_1$Sample.Name), "*", "-")
+  
+  meta_1$Thrombosis <- as.factor(meta_1$Thrombosis)
+  meta_1$State <- as.factor(meta_1$State)
+  meta_1$Normal <- as.factor(meta_1$Normal)
+  
+  meta_2 <- read.csv(meta_path_2, sep=',')
+  meta_2$T.stage <- as.factor(meta_2$T.stage)
+  meta_2$N.stage <- as.factor(meta_2$N.stage)
+  meta_2$M.stage <- as.factor(meta_2$M.stage)
+  meta_2$Thrombus.level.Mayo. <- as.factor(meta_2$Thrombus.level.Mayo.)
+  colnames(meta_2)[colnames(meta_2) == "Thrombus.level.Mayo."] <- "MayoLevel"
+  
+  meta <- merge(meta_1, meta_2,all = T)
+  
+  #order by SRR number
+  meta <- meta[order (meta[,"Run"]),]
+  
+  meta
+}
+# Consistent colors for heatmap
+ann_colors <- function()
+{
+  ann_color_list <- list( sex =  c( male = "#4575B4", 
+                                    female="#D73027"),
+                          Thrombosis = c( No ="#FAEBD7",
+                                          Yes="#D73027"),
+                          State = c( Normal = "#FAEBD7", 
+                                     Cancer = "#E88D7F", 
+                                     Thrombus="#D73027"),
+                          MayoLevel = c('-' = "#FAEBD7", 
+                                        '0' = "#E3BBAC", 
+                                        '1' = "#CD8C81", 
+                                        '2' = "#B75D55", 
+                                        '3' = "#A12E2A", 
+                                        '4' = "#8B0000"),
+                          T.stage = c('1a'= "#FAEBD7",
+                                      '1b'= "#E0DBD2",
+                                      '2a'= "#C6CCCD",
+                                      '2b'= "#ACBEC8",
+                                      '3a'= "#93AFC3",
+                                      '3b'= "#79A0BE",
+                                      '3c'= "#5F91B9",
+                                      '4' = "#4682B4"),
+                          N.stage = c('0' = "#FAEBD7", 
+                                      '1' = "#A0B6C5",
+                                      'x' = "#4682B4"),
+                          M.stage = c('0' = "#FAEBD7", 
+                                      '1' = "#4682B4"))
+  ann_color_list
+}
+# Create lists with genes for future analysis.
+# Currently using only Spliceosome and RBP.
+# Possible additions - mesenchymal_promoter_genes, hypoxia, kidney
+gene_lists_gen <- function(ctstk)
+{
+  motif_genes <- read.csv("gene_lists/enriched motifs.csv", sep = ',')
+  motif_genes <- motif_genes$HUGO.gene.symbol[motif_genes$HUGO.gene.symbol  %in% rownames(ctstk)]
+    
+  spliceosome_genes <- read.csv("gene_lists/splicosome_genes.csv", sep = ';', header = T)
+  spliceosome_genes <- unique(spliceosome_genes$Approved.symbol[spliceosome_genes$Approved.symbol %in% rownames(ctstk)])
+  spliceosome_genes <- c(spliceosome_genes, "DGCR14", "CXorf56", "RNU4ATAC", "RNU6ATAC")
+  
+  gene_lists <- list ("Motif genes" = motif_genes,
+                      "Spliceosome" = spliceosome_genes,)
+  
+  gene_lists
+}
+
+# Calculate quantile breaks between 0 to 1
+quantile_breaks <- function(xs, n = 10) {
+  breaks <- quantile(xs, probs = seq(0, 1, length.out = n), na.rm = TRUE)
+  breaks[!duplicated(breaks)]
+}
+
+# Calculate quantile breaks between min to max
+quantile_breaks2 <- function(xs, n = 10) {
+  breaks <- quantile(xs, probs = seq(min(xs), max(xs), length.out = n), na.rm = TRUE)
+  breaks[!duplicated(breaks)]
+}
+
+# Scale matrix by rows
+scale_rows <- function(x){
+  m = apply(x, 1, mean, na.rm = T)
+  s = apply(x, 1, sd, na.rm = T)
+  return((x - m) / s)
+}
+
+pca_plot <- function(object,pc1 = 1, pc2 = 2, #pcs to use
+                     point_size = 7, #point size
+                     text_size = 15,#size of label text
+                     myTitle = "Graph",
+                     groupMeta = NULL,
+                     exFactor = NULL,
+                     meta_type = 0,
+                     color_wheel = c("#4575B4","#FFFFBF", "#D73027"),
+                     markA = NULL,
+                     markB = NULL)
+{
+  object <- object[apply(object, 1, var, na.rm=TRUE) != 0,]
+  df_pca <- t(object)
+  pca <-  prcomp(df_pca[,apply(df_pca,2,function(x) sum(x)!=0)], scale. = T, center = T)
+  percentVar <- pca$sdev^2 / sum( pca$sdev^2 )   # the contribution to the total variance for each component
+  
+  if (!is.null(groupMeta))
+  {
+    if (meta_type == 0)
+    group <- factor(patient_state(groupMeta), 
+                   levels = c('Normal', 
+                              'Cancer', 
+                              'Primary Tumor', 
+                              'Thrombus Tumor'))
+    else
+    {
+      group1 <- factor(patient_state(groupMeta[1:189,]), 
+                      levels = c('Normal', 
+                                 'Cancer', 
+                                 'Primary Tumor', 
+                                 'Thrombus Tumor'))
+      group2 <- factor(exFactor)
+      group <- factor (c(group1,group2))
+    }
+  }
+  
+  # assembly the data for the plot
+  d <- data.frame(PC1=pca$x[,pc1], PC2=pca$x[,pc2], State = group)
+  
+  if(is.null(markA)) markA <- geom_blank()
+  else{markA <- geom_point(data = d[markA,],aes(x = PC1, y= PC2),pch=21,
+                              fill=NA, size=point_size+4, colour="#00C08B", stroke=2)}
+  
+  if(is.null(markB)) markB <- geom_blank()
+  else {markB <- geom_point(data = d[markB,],aes(x = PC1, y= PC2),pch=21, 
+                               fill=NA, size=point_size+4, colour="#FF64B0", stroke=2)}
+  
+  #create pc labels
+  xs = paste0("PC", as.character(pc1),": ", round(percentVar[pc1] * 100),"% variance")
+  ys = paste0("PC", as.character(pc2),": ", round(percentVar[pc2] * 100),"% variance")
+
+  ggplot(data=d, aes(x=PC1, y=PC2)) +
+           geom_point(aes(fill = d$State), shape = 21, colour = 'black', size=point_size) + 
+    markA + markB + xlab(xs) + ylab(ys) +
+    coord_fixed() + ggtitle(myTitle) + 
+    theme(plot.title = element_text(size=text_size),
+          legend.title=element_text(size=text_size))
+}
+
+feature_plot2 <- function(object,pc1 = 1, pc2 = 2, #pcs to use
+                          point_size = 7, #point size
+                          min_point_size = 0.01,
+                          text_size = 15,#size of label text
+                          inclusion_level = 1, #for feature plot need vector of incLevels
+                          myTitle = "Graph",
+                          color_wheel = c("#4575B4","#FFFFBF", "#D73027"),
+                          name_t = "Inclusion level",
+                          log2 = FALSE)
+{
+  if (log2 == TRUE)
+  {
+    inclusion_level <- log2 (inclusion_level + 1)
+  }
+
+  object <- object[apply(object, 1, var, na.rm=TRUE) != 0,]
+  df_pca <- t(object)
+  pca <-  prcomp(df_pca[,apply(df_pca,2,function(x) sum(x)!=0)], scale. = T, center = T)
+  percentVar <- pca$sdev^2 / sum( pca$sdev^2 )   # the contribution to the total variance for each component
+  
+  # assembly the data for the plot
+  d <- data.frame(PC1=pca$x[,pc1], PC2=pca$x[,pc2])
+  
+  #create pc labels
+  xs = paste0("PC", as.character(pc1),": ", round(percentVar[pc1] * 100),"% variance")
+  ys = paste0("PC", as.character(pc2),": ", round(percentVar[pc2] * 100),"% variance")
+  
+  color_breaks <- quantile_breaks2(inclusion_level)
+  point_style <- geom_point(aes(fill = inclusion_level), shape = 21, colour = 'black', 
+                            size=point_size * ((inclusion_level - min(inclusion_level)) / 
+                                               (max(inclusion_level) - min(inclusion_level))+ 
+                                               min_point_size))
+  
+  gradient_style <- scale_fill_gradientn(colors = colorRampPalette(color_wheel)(length(color_breaks)-1),
+                                         name = name_t, 
+                                         breaks = color_breaks,
+                                         labels = formatC(c(min(color_breaks), max(color_breaks)), digits = 2, format = 'f'))
+  
+  ggplot(data=d, aes(x=d$PC1, y=d$PC2)) +
+    point_style + gradient_style + xlab(xs) + ylab(ys) +
+    coord_fixed() + ggtitle(myTitle) + 
+    theme(plot.title = element_text(size=text_size),
+          legend.title=element_text(size=text_size))
+}
+
+pcaMethods3 <- function (object, # deseq object
+                         df,  #deseq result object
+                         intgroup="State", # by which column to divide groups
+                         returnData=FALSE, 
+                         pc1 = 1, pc2 = 2, #pcs to use
+                         pCutoff = 0.01, #for deseq res genes
+                         FCcutoff = 1, #for deseq res genes
+                         pSize = 1, #point size
+                         labStyle = 1, #label type
+                         colorStyle = 1, #0 for normal size 1 for size according to inclusion level & colored as well
+                         toScale = FALSE, #scale pca
+                         lSize = 5, #size of label
+                         tSize = 15,#size of label text
+                         gStyle = 1, # 0 none 1 scaling colors
+                         incLevel_size = 1, #for feature plot need vector of incLevels
+                         sStyle = 0, # 0 none 1 with chagning shapes
+                         s2Style = FALSE, #2 true for 1 shape feature plot
+                         lColor = 1, #color of label 1 is rainbow else is black
+                         marking1 = FALSE, #mark selected points1
+                         marking2 = FALSE,#mark selected points2
+                         myTitle = "Graph",
+                         color_wheel = tricolor,#c("#4575B4","#FFFFBF", "#D73027"),
+                         groupMeta = NULL){
+  if (length(incLevel_size) > 1)
+    incLevel_size <- (incLevel_size - min(incLevel_size)) / (max(incLevel_size) - min(incLevel_size))
+  
+  # perform a PCA on the data in assay(x) for the selected genes
+  df_pca <- t(df)
+  if (toScale == FALSE) pca <- prcomp(df_pca)
+  if (toScale == TRUE) pca <-  prcomp(df_pca[,apply(df_pca,2,function(x) sum(x)!=0)], scale. = T, center = T)
+  percentVar <- pca$sdev^2 / sum( pca$sdev^2 )   # the contribution to the total variance for each component
+  
+  if (!all(intgroup %in% names(colData(object)))) {
+    stop("the argument 'intgroup' should specify columns of colData(dds)")
+  }
+  
+  intgroup.df <- as.data.frame(colData(object)[, intgroup, drop=FALSE])
+  
+  # add the intgroup factors together to create a new grouping factor
+  group <- if (length(intgroup) > 1) {
+    factor(apply( intgroup.df, 1, paste, collapse=":"))
+  } else {
+    colData(object)[[intgroup]]
+  }
+  
+  if (!is.null(groupMeta))
+    group <-factor(patient_state(groupMeta), 
+                   levels = c('Normal', 
+                              'Cancer', 
+                              'Primary Tumor', 
+                              'Thrombus Tumor'))
+  
+  # assembly the data for the plot
+  d <- data.frame(PC1=pca$x[,pc1], PC2=pca$x[,pc2], group=group, intgroup.df, name=colnames(object))
+  if (returnData) {
+    attr(d, "percentVar") <- percentVar[1:2]
+    return(d)
+  }
+  #create pc labels
+  xs = paste0("PC", as.character(pc1),": ")
+  ys = paste0("PC", as.character(pc2),": ")
+  
+  #create color for lables
+  if (lColor == 1)
+    lColor <- rainbow(length(levels(d$group)))[as.integer(d$group)]
+  else
+    lColor <- "black"
+  
+  cbreaks <- quantile_breaks(incLevel_size,101)
+  switch (labStyle,
+          lStyle <- geom_blank(),
+          lStyle <- geom_text(label=colnames(df),hjust=0, vjust=0, size = lSize,color = lColor),
+          lStyle <- geom_label(size = lSize, label=colnames(df), nudge_x = 0.25, nudge_y = 0.25, check_overlap = T),
+          lStyle <- geom_label_repel(size = lSize,max.overlaps = Inf,aes(label = colnames(df)), box.padding   = 0.1, point.padding = 0.1,segment.color = 'grey50'))
+  switch (colorStyle,
+          cStyle <- geom_point(size=pSize * incLevel_size),
+          cStyle <- geom_point(aes(color = incLevel_size), size=pSize * log(100*(incLevel_size+0.0101))),
+          cStyle <- geom_point(aes(fill = incLevel_size), colour = 'black', size=pSize * log(100*(incLevel_size+0.0101)))) 
+  
+  switch (gStyle,
+          grStyle <- geom_blank(),
+          grStyle <- scale_colour_gradientn(colors = colorRampPalette(color_wheel)(length(cbreaks)-1),
+                                            name = "Inclusion level",
+                                            values = cbreaks),
+          grStyle <- scale_fill_gradientn(colors = colorRampPalette(color_wheel)(length(cbreaks)-1),
+                                          name = "Inclusion level",
+                                          values = cbreaks))
+  if(class(marking1) == "logical")
+  {
+    marking1 <- geom_blank()
+  }
+  else
+  {
+    marking1 <- geom_point(data = d[marking1,],
+                           aes(x = PC1, y= PC2),
+                           pch=21, 
+                           fill=NA, 
+                           size=pSize+3, colour="darkorange", stroke=0.5)
+  }
+  if(class(marking2) == "logical")
+  {
+    marking2 <- geom_blank()
+  }
+  else
+  {
+    marking2 <- geom_point(data = d[marking2,],
+                           aes(x = PC1, y= PC2),
+                           pch=21, 
+                           fill=NA, 
+                           size=pSize+3, colour="deepskyblue", stroke=0.5)
+  }
+  if ((length(unique(d$group)) < 9) & (sStyle == 1))
+  {
+    shape_values <- c(15,16,17,11,13,8,9,12)[1:length(unique(d$group))]
+    tguide <- "legend"
+    if(s2Style!= FALSE) {
+      shape_values <- rep(s2Style,length(unique(d$group)))
+      tguide <- "none"}
+    sStyle <- scale_shape_manual(values = shape_values, guide = tguide)
+    ggplot(data=d, aes(x=d$PC1, y=d$PC2, shape = d$group)) + 
+      lStyle +
+      cStyle + 
+      grStyle + 
+      sStyle + 
+      marking1 +
+      marking2 +
+      xlab(paste0(xs,round(percentVar[pc1] * 100),"% variance")) +
+      ylab(paste0(ys,round(percentVar[pc2] * 100),"% variance")) +
+      labs(shape = paste(intgroup, collapse = ":")) + 
+      coord_fixed() + ggtitle(myTitle) + theme(plot.title = element_text(size=tSize),
+                                               legend.title=element_text(size=tSize))
+  }
+  else
+  {
+    legend_title <- ifelse(!is.null(groupMeta), 'State', paste(intgroup, collapse = ":"))
+    sStyle <-geom_blank()
+    ggplot(data=d, aes(x=d$PC1, y=d$PC2, color = d$group)) + 
+      labs(type = paste(intgroup, collapse = ":")) + #glossary for color group
+      lStyle +
+      cStyle + 
+      grStyle + 
+      sStyle + 
+      marking1 +
+      marking2 +
+      xlab(paste0(xs,round(percentVar[pc1] * 100),"% variance")) +
+      ylab(paste0(ys,round(percentVar[pc2] * 100),"% variance")) +
+      labs(color = legend_title) + 
+      coord_fixed() + ggtitle(myTitle) + theme(plot.title = element_text(size=tSize),
+                                               legend.title=element_text(size=tSize))
+  }
+  
+}
+        
+feature_plot3 <- function(object,pc1 = 1, pc2 = 2, #pcs to use
+                     point_size = 7, #point size
+                     min_point_size = 0.01,
+                     text_size = 15,#size of label text
+                     inclusion_level_o = 1, #for feature plot need vector of incLevels
+                     myTitle = "Graph",
+                     color_wheel = c("#4575B4","#FFFFBF", "#D73027"),
+                     name_t = "Inclusion level")
+{
+  inclusion_level <- (inclusion_level_o - min(inclusion_level_o)) / 
+    (max(inclusion_level_o) - min(inclusion_level_o))
+
+  object <- object[apply(object, 1, var, na.rm=TRUE) != 0,]
+  df_pca <- t(object)
+  pca <-  prcomp(df_pca[,apply(df_pca,2,function(x) sum(x)!=0)], scale. = T, center = T)
+  percentVar <- pca$sdev^2 / sum( pca$sdev^2 )   # the contribution to the total variance for each component
+  
+  # assembly the data for the plot
+  d <- data.frame(PC1=pca$x[,pc1], PC2=pca$x[,pc2])
+  
+  #create pc labels
+  xs = paste0("PC", as.character(pc1),": ", round(percentVar[pc1] * 100),"% variance")
+  ys = paste0("PC", as.character(pc2),": ", round(percentVar[pc2] * 100),"% variance")
+  
+  color_breaks <- quantile_breaks(inclusion_level,101) #inclusion_level
+  point_style <- geom_point(aes(fill = inclusion_level), shape = 21, colour = 'black', 
+                            size=point_size * (inclusion_level+min_point_size))
+  
+  gradient_style <- scale_fill_gradientn(colors = colorRampPalette(color_wheel)(length(color_breaks)-1),
+                                         name = name_t, 
+                                         values = color_breaks, 
+                                         breaks = c(min(inclusion_level), median(inclusion_level) ,max(inclusion_level)),
+                                         labels=  formatC2(c(min(inclusion_level_o), median(inclusion_level_o) ,max(inclusion_level_o))))#, digits = 2, format = 'f'))
+  
+  
+  
+  ggplot(data=d, aes(x=d$PC1, y=d$PC2)) +
+    point_style  + gradient_style + 
+    xlab(xs) + ylab(ys) +
+    coord_fixed() + ggtitle(myTitle) + 
+    theme(plot.title = element_text(size=text_size),
+          legend.title=element_text(size=text_size))
+}
+
+# a long path with comma between vlaues
+rmats_path_generator <- function (samples, pre, post){
+  paste(paste0(pre,samples,post), collapse=',')
+}
+
+                               
+sigres <- function(res, padj_l = 0.01, l2fc_l = 1, indx=0) {
+  ##Ex sigres(res, 0.01, 2, 1) 
+  if (indx == 0) { 
+    subset(res, padj<padj_l & abs(log2FoldChange)>l2fc_l)
+  } else {
+    which (res$padj < padj_l)[which(abs(res[which (res$padj < padj_l),][,"log2FoldChange"]) > l2fc_l)]
+  }
+}
+                               
+pcaMethods2 <- function (object, # deseq object
+                        objres,  #deseq result object
+                        intgroup="State", # by which column to divide groups
+                        ntop=500, #number of genes for pca
+                        returnData=FALSE, 
+                        method = "var", #by which result perfrom pca
+                        list = c(1), #list of possible genes
+                        pc1 = 1, pc2 = 2, #pcs to use
+                        pCutoff = 0.01, #for deseq res genes
+                        FCcutoff = 1, #for deseq res genes
+                        pSize = 1, #point size
+                        labStyle = 1, #label type
+                        colorStyle = 1, #0 for normal size 1 for size according to inclusion level & colored as well
+                        toScale = FALSE, #scale pca
+                        lSize = 5, #size of label
+                        tSize = 15,#size of label text
+                        gStyle = 1, # 0 none 1 scaling colors
+                        incLevel_size = 1, #for feature plot need vector of incLevels
+                        sStyle = 0, # 0 none 1 with chagning shapes
+                        s2Style = FALSE, #2 true for 1 shape feature plot, choose shape number (21 - circle with fill)
+                        lColor = 1, #color of label 1 is rainbow else is black
+                        marking1 = FALSE, #mark selected points1
+                        marking2 = FALSE,#mark selected points2
+                        myTitle = "Graph",
+                        color_wheel = tricolor,#c("#4575B4","#FFFFBF", "#D73027"),
+                        groupMeta = NULL){
+  if (length(incLevel_size) > 1)
+    incLevel_size <- (incLevel_size - min(incLevel_size)) / (max(incLevel_size) - min(incLevel_size))
+  
+  # calculate the variance for each gene
+  switch (method,
+          "all" = filter <- 1:length(counts(object, normalized = TRUE)[,1]),
+          "var" = filter <- rowVars(counts(object, normalized = TRUE)), # object is dds
+          "signifi" = filter <- sigres (objres,pCutoff, FCcutoff, 1 ),
+          "list" = filter <- list) # object is res
+  
+  # select the ntop genes
+  select <- order(filter, decreasing=TRUE)[seq_len(min(ntop, length(filter)))]
+  
+  # perform a PCA on the data in assay(x) for the selected genes
+  df_pca <- t(counts(object, normalized = TRUE)[select,])
+  if (toScale == FALSE) pca <- prcomp(df_pca)
+  if (toScale == TRUE) pca <-  prcomp(df_pca[,apply(df_pca,2,function(x) sum(x)!=0)], scale. = T, center = T)
+  percentVar <- pca$sdev^2 / sum( pca$sdev^2 )   # the contribution to the total variance for each component
+  
+  if (!all(intgroup %in% names(colData(object)))) {
+    stop("the argument 'intgroup' should specify columns of colData(dds)")
+  }
+  
+  intgroup.df <- as.data.frame(colData(object)[, intgroup, drop=FALSE])
+  
+  # add the intgroup factors together to create a new grouping factor
+  group <- if (length(intgroup) > 1) {
+    factor(apply( intgroup.df, 1, paste, collapse=":"))
+  } else {
+    colData(object)[[intgroup]]
+  }
+  
+  if (!is.null(groupMeta))
+    group <-factor(patient_state(groupMeta), 
+                   levels = c('Normal', 
+                              'Cancer', 
+                              'Primary Tumor', 
+                              'Thrombus Tumor'))
+  
+  # assembly the data for the plot
+  d <- data.frame(PC1=pca$x[,pc1], PC2=pca$x[,pc2], group=group, intgroup.df, name=colnames(object))
+  if (returnData) {
+    attr(d, "percentVar") <- percentVar[1:2]
+    return(d)
+  }
+  #create pc labels
+  xs = paste0("PC", as.character(pc1),": ")
+  ys = paste0("PC", as.character(pc2),": ")
+  
+  #create color for lables
+  if (lColor == 1)
+    lColor <- rainbow(length(levels(d$group)))[as.integer(d$group)]
+  else
+    lColor <- "black"
+  
+  cbreaks <- quantile_breaks(incLevel_size,101)
+  switch (labStyle,
+          lStyle <- geom_blank(),
+          lStyle <- geom_text(label=colnames(counts(object, normalized = TRUE)),hjust=0, vjust=0, size = lSize,color = lColor),
+          lStyle <- geom_label(size = lSize, label=colnames(counts(object, normalized = TRUE)), nudge_x = 0.25, nudge_y = 0.25, check_overlap = T),
+          lStyle <- geom_label_repel(size = lSize,max.overlaps = Inf,aes(label = colnames(counts(object, normalized = TRUE))), box.padding   = 0.1, point.padding = 0.1,segment.color = 'grey50'))
+  switch (colorStyle,
+          cStyle <- geom_point(size=pSize * incLevel_size),
+          cStyle <- geom_point(aes(color = incLevel_size), size=pSize * log(100*(incLevel_size+0.0101))),
+          cStyle <- geom_point(aes(fill = incLevel_size), colour = 'black', size=pSize * log(100*(incLevel_size+0.0101)))) 
+  
+  switch (gStyle,
+          grStyle <- geom_blank(),
+          grStyle <- scale_colour_gradientn(colors = colorRampPalette(color_wheel)(length(cbreaks)-1),
+                                            name = "Inclusion level",
+                                            values = cbreaks),
+          grStyle <- scale_fill_gradientn(colors = colorRampPalette(color_wheel)(length(cbreaks)-1),
+                                            name = "Inclusion level",
+                                            values = cbreaks))
+  if(class(marking1) == "logical")
+  {
+    marking1 <- geom_blank()
+  }
+  else
+  {
+    marking1 <- geom_point(data = d[marking1,],
+                          aes(x = PC1, y= PC2),
+                          pch=21, 
+                          fill=NA, 
+                          size=pSize+3, colour="darkorange", stroke=0.5)
+  }
+  if(class(marking2) == "logical")
+  {
+    marking2 <- geom_blank()
+  }
+  else
+  {
+    marking2 <- geom_point(data = d[marking2,],
+                          aes(x = PC1, y= PC2),
+                          pch=21, 
+                          fill=NA, 
+                          size=pSize+3, colour="deepskyblue", stroke=0.5)
+  }
+  if ((length(unique(d$group)) < 9) & (sStyle == 1))
+  {
+    shape_values <- c(15,16,17,11,13,8,9,12)[1:length(unique(d$group))]
+    tguide <- "legend"
+    if(s2Style!= FALSE) {
+      shape_values <- rep(s2Style,length(unique(d$group)))
+      tguide <- "none"}
+    sStyle <- scale_shape_manual(values = shape_values, guide = tguide)
+    ggplot(data=d, aes(x=d$PC1, y=d$PC2, shape = d$group)) + 
+      lStyle +
+      cStyle + 
+      grStyle + 
+      sStyle + 
+      marking1 +
+      marking2 +
+      xlab(paste0(xs,round(percentVar[pc1] * 100),"% variance")) +
+      ylab(paste0(ys,round(percentVar[pc2] * 100),"% variance")) +
+      labs(shape = paste(intgroup, collapse = ":")) + 
+      coord_fixed() + ggtitle(myTitle) + theme(plot.title = element_text(size=tSize),
+                                               legend.title=element_text(size=tSize))
+  }
+  else
+  {
+    legend_title <- ifelse(!is.null(groupMeta), 'State', paste(intgroup, collapse = ":"))
+    sStyle <-geom_blank()
+  ggplot(data=d, aes(x=d$PC1, y=d$PC2, color = d$group)) + 
+    labs(type = paste(intgroup, collapse = ":")) + #glossary for color group
+    lStyle +
+    cStyle + 
+    grStyle + 
+    sStyle + 
+    marking1 +
+    marking2 +
+    xlab(paste0(xs,round(percentVar[pc1] * 100),"% variance")) +
+    ylab(paste0(ys,round(percentVar[pc2] * 100),"% variance")) +
+    labs(color = legend_title) + 
+    coord_fixed() + ggtitle(myTitle) + theme(plot.title = element_text(size=tSize),
+                                             legend.title=element_text(size=tSize))
+  }
+  
+}
+                                                    
+tricolor <- c("#4575B4", "#FFFFBF", "#D73027")          
+                                                    
+~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ 
+~ Generate data frames ~   
+```{r}
+# Download Wang's data.
+# Perform alignment (we used STAR).
+# counts_ccRCC_wang_2020.csv contains the results.
+if (file.exists("counts_ccRCC_wang_2020.csv"))
+{
+    cts <- read.csv(file = "counts_ccRCC_wang_2020.csv", row.names = 1)
+} else { print('Counts file not found')}
+
+# Download Wang's metadata (there are 2 files)
+meta <- metadata_table(meta_path_1 = "Data from Wang et al/Table meta_build1.csv",
+                       meta_path_2 = "Data from Wang et al/Table meta_build2.csv")
 
 rownames(meta) <- meta$Sample.Name
 
-#Change to Sample name instead of Run
-if (identical(meta[order(meta[,"Run"]), "Run"], colnames(cts)))
-{colnames(cts) <- meta[order(meta[, "Run"]), "Sample.Name"]}
+# Verify counts' columns are ordered by Run number 
+# Change to Sample name instead of Run
+if (identical(sort(meta$Run), colnames(cts)))
+{colnames(cts) <- meta$Sample.Name[order(meta$Run)]}
 
-#sub-tables
+# Sub tables for additional analysis
+# cts_c_t, no Normal samples
 cts_c_t <- cts[,meta$State != "Normal"]
-cts_pt_tt <- cts[,meta$Thrombosis == "Yes"]
 
-if(!exists("wrs_res"))
-{ wrs_res <- wrs_res_gen(cts, meta)} #Wilcoxon rank sum test for differential expressed genes
+# For future heatmaps
+annotation_color_list <- ann_colors() 
 
-annotation_color_list <- ann_colors() #for future heatmaps
+# For ease of PCA and plots
+gene_lists <- gene_lists_gen(cts) 
 
-gene_lists <- gene_lists_gen(cts, wrs_res) #for pca and more
+# Annotation order
+state_levels <- c('Normal','Cancer','Primary Tumor','Thrombus Tumor') 
 
-state_levels <- c('Normal','Cancer','Primary Tumor','Thrombus Tumor') #annotation
+# Annotation order
+Ann_all <- meta[,c('sex','Age',
+                   'T.stage','N.stage','M.stage','MayoLevel',
+                   'State','Thrombosis', 
+                   'Provider')]
+rownames(Ann_all) <- meta$Sample.Name
 
-Ann_all <- meta[,c('sex','Age','T.stage','N.stage','M.stage','MayoLevel','State','Thrombosis', 'Provider')]
-  rownames(Ann_all) <- meta$Sample.Name
-  
+# Differntial gene expression analysis
+# Remember to always perform QC (assumed distrebution fitting etc.)
 if (!exists("dsq_normal_cancer"))
 {
   dsq_normal_cancer <- DESeqDataSetFromMatrix(countData = cts,
@@ -58,56 +706,50 @@ if (!exists("dsq_normal_cancer"))
   res_normal_cancer <- results(dsq_normal_cancer,contrast = c('Normal','Yes','No'))
   if(!file.exists("Table counts normalized.csv")){
     write.csv(cts_normal_cancer, file = "Table counts normalized.csv")}
-  
-  dsq_nc_t <- DESeqDataSetFromMatrix(countData = cts,
-                                              colData = meta,
-                                              design= ~ Thrombosis)
-  dsq_nc_t <- DESeq(dsq_nc_t)
-  cts_nc_t <- counts(dsq_nc_t,normalized=TRUE)
-  res_nc_t <- results(dsq_nc_t,contrast = c('Thrombosis','Yes','No'))
 }
   
-#######RMATS ORDER ALL#####
+~ Helper table for rMATS order ~
   x <- read.csv('Table rmats_order.csv', row.names = 1)
   rmats_order_all <- x$x
   names(rmats_order_all) <- rownames(x)
 
-######DECONV META##########
+~ Deconvolution meta ~
+# After performing deconvolution with kidney cell atlas
 ref.based.estimates <- read.csv(file = "Table deconvolution.csv", row.names = 1)
-cnv_hm <- ref.based.estimates # For heatmap
-cnv_hm_breaks <- quantile_breaks(cnv_hm,101) # for better coloring
+# For heatmap
+cnv_hm <- ref.based.estimates 
+# For better coloring break to quantiles
+cnv_hm_breaks <- quantile_breaks(cnv_hm,101) 
 cnv_hm[is.na(cnv_hm)] <- 0 # na = 0
 
-#annotations above heatmap for better order,  rownames(ref.based.estimates) are cell types
-ann_all_col <- c('sex','Age', 'MayoLevel','T.stage', 'N.stage','M.stage',
-                 rownames(ref.based.estimates), 'State', 'Thrombosis', 'Provider')
+# Annotations above heatmap for better order, rownames(ref.based.estimates) are cell types
+ann_all_col <- c('sex', 'Age', 
+                 'MayoLevel', 'T.stage', 'N.stage','M.stage',
+                 rownames(ref.based.estimates), 
+                 'State', 'Thrombosis', 'Provider')
 
-#df for annotation colors
-Ann_all_t <- Ann_all #Ann_all is a df for annotation. rows are sample, columns are annotation to add
-annotation_color_list_t <- ann_colors() #color of other annotations
+# Ann_all is a df for annotation. Rows are samples, columns are annotation to add
+Ann_all_t <- Ann_all 
+Ann_all_t[,'Provider'] <- meta$BIOMATERIAL_PROVIDER
+# Color of other annotations
+annotation_color_list_t <- ann_colors() 
 
-#color range 0 to 1 , can be also according to qunatile_breaks
-cvm_col <- colorRamp2(seq(0,1,length.out = nrow(cnv_hm)),#cnv_hm_breaks, 
-                       colorRampPalette(c('ghostwhite', '#FFFFBF','firebrick'))(nrow(cnv_hm)))
-
-#add color range for each cell type, in range of min and max for that cell type
+# Add color range for each cell type, in range of min and max for that cell type
 for (row in rownames(ref.based.estimates))
 {
-  Ann_all_t[,row] <- as.numeric(cnv_hm[row,]) #change color by seq or [0,1]
+  Ann_all_t[,row] <- as.numeric(cnv_hm[row,]) # Change color by seq or [0,1]
   annotation_color_list_t[[row]] <- colorRamp2(seq(min(ref.based.estimates[row,]),
                                                    max(ref.based.estimates[row,]),
-                                                   length.out = nrow(cnv_hm)),#cnv_hm_breaks, 
-                       colorRampPalette(c('ghostwhite', '#FFFFBF','firebrick'))(nrow(cnv_hm)))#cvm_col
+                                                   length.out = nrow(cnv_hm)), #cnv_hm_breaks, 
+                       colorRampPalette(c('ghostwhite', '#FFFFBF','firebrick'))(nrow(cnv_hm)))
 }
-
-#Ann_all_t[,'Provider'] <- meta$BIOMATERIAL_PROVIDER
 
 rmats_events_combined_inc <- read.csv('Table S1 inclusion levels.csv', row.names = 1)
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~HEATMAP WITH CELL TYPE   V
+~ Heatmap ~
 ```{r}
-for_complexHM <- as.matrix(cts_normal_cancer[unique(gene_lists$Splicosome),])
+for_complexHM <- as.matrix(cts_normal_cancer[unique(gene_lists$Spliceosome),])
 for_complexHM <- for_complexHM[apply(for_complexHM, 1, var, na.rm=TRUE) != 0,] # remove genes with no variance
 
 cell_h <- 1
@@ -154,7 +796,7 @@ draw (cHM,heatmap_legend_side = "bottom",annotation_legend_side = "left", legend
 dev.off()
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PCA SIMPLE   V
+~ PCA ~
 ```{r}
 pca_simple <- pca_plot(cts_normal_cancer,
                      groupMeta = meta,
@@ -174,26 +816,51 @@ pca_simple <- pca_plot(cts_normal_cancer,
         axis.text.x=element_text(size=30),
         axis.text.y=element_text(size=30))
 
-ggsave("plots/PCA_Simple.png", width = 15, height = 15, limitsize = FALSE)
+ggsave("plots/PCA.png", width = 15, height = 15, limitsize = FALSE)
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PCA FEATURE PLOT (COUNTS/RMATS)   V
+~ rMATS event feature Plot ~
 ```{r}
-#df with events
-rmats_pca <- (na.omit(rmats_events_combined_inc[,colnames(cts_normal_cancer)]))
+#rownames(rmats_events_combined_inc) <- 1:nrow(rmats_events_combined_inc)
+#rmats_new_dir <- 'RMATS_NEW/'
 
-#event id
-gene<- c('RMATS')
-event_ix <- 100
-gene_feature_plot <- feature_plot2(rmats_pca,
-                                  inclusion_level = as.numeric(rmats_pca[event_ix,]),
-                                  myTitle = paste0('rmats combined ','.'))
+#177413 APOPT1
+#cells <- c(140,167,96,179)
+#c(346,491,545)
+event <- 19653
+samples_inc <- c(eval(parse(text = paste0("c(",asse[event,"IncLevel1"] ,")"))),
+                       eval(parse(text = paste0("c(",asse[event,"IncLevel2"] ,")"))))
+names(samples_inc) <- rmats_order_all
+samples_inc[is.na(samples_inc)] <- mean(samples_inc, na.rm = T)
 
-ggsave(paste0('plots/FEATURE_',gene,'.png'), 
-         plot = gene_feature_plot, width = 15, height = 15)
+cells <- 'UPP1'
+for (cell in cells)
+ {
+   rmats_feature_plot <- feature_plot3(cts_normal_cancer,
+                                         inclusion_level = samples_inc[meta$Sample.Name],
+                                         min_point_size = 0.5,
+                                         myTitle = cells,#rmats_events_combined_inc[cell,'geneSymbol'],
+                                         color_wheel = c("skyblue","#FFFFBF", "#D73027"),
+                                         name_t = "Inclusion level") +
+     guides(fill = guide_colourbar(ticks.colour = "black",
+                                   ticks.linewidth = 1)) +
+     theme_bw() + 
+     theme(plot.title = element_text(size=40, hjust = 0.5),
+           legend.position = 'bottom',
+           legend.direction = 'horizontal',
+           legend.title = element_text(size=30),
+           legend.text = element_text(size=25, hjust = 0.0),
+           legend.key.width = unit(1, "inches"),
+           axis.title = element_text(size=30),
+           axis.text.x=element_text(size=30),
+           axis.text.y=element_text(size=30))
+  
+  ggsave(paste0('plots/test-',cell,'x.png'), #ggsave(paste0(rmats_new_dir,cell,'.png'), 
+         plot = rmats_feature_plot, width = 15, height = 15)
+ }
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PCA RMATS    V
+~ PCA rMATS ~
 ```{r}
 pca_simple<-pcaMethods3(dsq_normal_cancer,
            df = na.omit(rmats_events_combined_inc[,colnames(cts_normal_cancer)]),
@@ -210,13 +877,13 @@ pca_simple<-pcaMethods3(dsq_normal_cancer,
            #marking1 = c('C011c','C011t','C012c','C012t','C013c','C013t','C014c','C014t','C015c','C015t','C016c','C016t'),
            #marking2 = c('C030c','C030t','C031c','C031t','C032c','C032t','C033c','C033t','C034c','C034t','C035c','C035t','C036c','C036t'),
            incLevel_size = 1,
-           myTitle = 'PCA (RMATS events combined)',
+           myTitle = 'PCA (rATS events combined)',
            groupMeta = meta) + theme_bw()
 
-ggsave("plots/PCA_RMATS1.png", width = 10, height = 10)
+ggsave("plots/PCA_rMATS.png", width = 10, height = 10)
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PCA WITH ARROW, DUMB WAY   V
+~ PCA with arrow ~
 ```{r fig.height=15, fig.width=15}
 
 df_arw <- cts_normal_cancer[, meta$Thrombosis == 'Yes']
@@ -229,110 +896,57 @@ percentVar <- df_pca_arw$sdev^2 / sum( df_pca_arw$sdev^2 )
 xs = paste0("PC1: ", round(percentVar[1] * 100),"% variance")
 ys = paste0("PC2: ", round(percentVar[2] * 100),"% variance")
 
-df_pca_arw <- data.frame( x = df_pca_arw$x[,"PC1"],y = df_pca_arw$x[,"PC2"],state = patient_state(meta[meta$Thrombosis == 'Yes',]))
+df_pca_arw <- data.frame(x = df_pca_arw$x[,"PC1"],
+                         y = df_pca_arw$x[,"PC2"],
+                         state = patient_state(meta[meta$Thrombosis == 'Yes',])
+                        )
 df_pca_arw <- df_pca_arw[order(rownames(df_pca_arw))[1:60],]
-row_odd <- seq_len(60) %% 2
+starts <- seq(1, 59, by = 2)
+ends   <- seq(2, 60, by = 2)
 
+df_segments <- data.frame(
+    x = df_pca_arw$x[starts],
+    y = df_pca_arw$y[starts],
+    xend = df_pca_arw$x[ends],
+    yend = df_pca_arw$y[ends]
+)
 
-
-df_arw_part <- geom_segment (aes(x = df_pca_arw[row_odd == 0,'x'],
-                                 y = df_pca_arw[row_odd == 0,'y'],
-                                 xend = df_pca_arw[row_odd == 1,'x'],
-                                 yend = df_pca_arw[row_odd == 1,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65)
-
-df_pnt_part <- ggplot() + 
-  geom_point(data = df_pca_arw,aes(x = x, y = y,  color = state),size = 7, alpha = 1.0)   +
-  geom_text(data = df_pca_arw, aes(x = x,   y = y), label = rownames(df_pca_arw), color = "black",size = 3)
-
-pca_simple_arrow <- df_pnt_part + #pca_simple + 
-  geom_segment (aes(x = df_pca_arw[1,'x'],y = df_pca_arw[1,'y'],xend = df_pca_arw[2,'x'],yend = df_pca_arw[2,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[3,'x'],y = df_pca_arw[3,'y'],xend = df_pca_arw[4,'x'],yend = df_pca_arw[4,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[5,'x'],y = df_pca_arw[5,'y'],xend = df_pca_arw[6,'x'],yend = df_pca_arw[6,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[7,'x'],y = df_pca_arw[7,'y'],xend = df_pca_arw[8,'x'],yend = df_pca_arw[8,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[9,'x'],y = df_pca_arw[9,'y'],xend = df_pca_arw[10,'x'],yend = df_pca_arw[10,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[11,'x'],y = df_pca_arw[11,'y'],xend = df_pca_arw[12,'x'],yend = df_pca_arw[12,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[13,'x'],y = df_pca_arw[13,'y'],xend = df_pca_arw[14,'x'],yend = df_pca_arw[14,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[15,'x'],y = df_pca_arw[15,'y'],xend = df_pca_arw[16,'x'],yend = df_pca_arw[16,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[17,'x'],y = df_pca_arw[17,'y'],xend = df_pca_arw[18,'x'],yend = df_pca_arw[18,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[19,'x'],y = df_pca_arw[19,'y'],xend = df_pca_arw[20,'x'],yend = df_pca_arw[20,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[21,'x'],y = df_pca_arw[21,'y'],xend = df_pca_arw[22,'x'],yend = df_pca_arw[22,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[23,'x'],y = df_pca_arw[23,'y'],xend = df_pca_arw[24,'x'],yend = df_pca_arw[24,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[25,'x'],y = df_pca_arw[25,'y'],xend = df_pca_arw[26,'x'],yend = df_pca_arw[26,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[27,'x'],y = df_pca_arw[27,'y'],xend = df_pca_arw[28,'x'],yend = df_pca_arw[28,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[29,'x'],y = df_pca_arw[29,'y'],xend = df_pca_arw[30,'x'],yend = df_pca_arw[30,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[31,'x'],y = df_pca_arw[31,'y'],xend = df_pca_arw[32,'x'],yend = df_pca_arw[32,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[33,'x'],y = df_pca_arw[33,'y'],xend = df_pca_arw[34,'x'],yend = df_pca_arw[34,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[35,'x'],y = df_pca_arw[35,'y'],xend = df_pca_arw[36,'x'],yend = df_pca_arw[36,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[37,'x'],y = df_pca_arw[37,'y'],xend = df_pca_arw[38,'x'],yend = df_pca_arw[38,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[39,'x'],y = df_pca_arw[39,'y'],xend = df_pca_arw[40,'x'],yend = df_pca_arw[40,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[41,'x'],y = df_pca_arw[41,'y'],xend = df_pca_arw[42,'x'],yend = df_pca_arw[42,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[43,'x'],y = df_pca_arw[43,'y'],xend = df_pca_arw[44,'x'],yend = df_pca_arw[44,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[45,'x'],y = df_pca_arw[45,'y'],xend = df_pca_arw[46,'x'],yend = df_pca_arw[46,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[47,'x'],y = df_pca_arw[47,'y'],xend = df_pca_arw[48,'x'],yend = df_pca_arw[48,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[49,'x'],y = df_pca_arw[49,'y'],xend = df_pca_arw[50,'x'],yend = df_pca_arw[50,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[51,'x'],y = df_pca_arw[51,'y'],xend = df_pca_arw[52,'x'],yend = df_pca_arw[52,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[53,'x'],y = df_pca_arw[53,'y'],xend = df_pca_arw[54,'x'],yend = df_pca_arw[54,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[55,'x'],y = df_pca_arw[55,'y'],xend = df_pca_arw[56,'x'],yend = df_pca_arw[56,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[57,'x'],y = df_pca_arw[57,'y'],xend = df_pca_arw[58,'x'],yend = df_pca_arw[58,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  geom_segment (aes(x = df_pca_arw[59,'x'],y = df_pca_arw[59,'y'],xend = df_pca_arw[60,'x'],yend = df_pca_arw[60,'y']),
-                             arrow = arrow(length=unit(.5, 'cm')),colour = "black",alpha = 0.6,lwd = 0.65) +
-  theme_bw() + labs (x = xs, y = ys) + 
-  theme(plot.title = element_text(size=40, hjust = 0.5),
-        legend.box.background = element_rect(colour = "black"),
-        legend.position = 'bottom',
-        legend.title = element_blank(),
-        legend.text = element_text(size=30, margin = margin(r = 40, unit = "pt")),
-        axis.title = element_text(size=30),
-        axis.text.x=element_text(size=30),
-        axis.text.y=element_text(size=30))
-
-ggsave("plots/PCA_SIMPLE_ARROW.png", width = 15, height = 15)
+pca_simple_arrow <- ggplot(df_pca_arw, aes(x = x, y = y)) +
+  geom_segment(data = df_segments, 
+               aes(x = x, y = y, xend = xend, yend = yend),
+               arrow = arrow(length = unit(.5, 'cm')), 
+               colour = "black", alpha = 0.6, lwd = 0.65) +
+  geom_point(aes(color = state), size = 7, alpha = 1.0) +
+  geom_text(aes(label = rownames(df_pca_arw)), color = "black", size = 3) +
+  theme_bw() + 
+  labs(x = xs, y = ys) +
+  theme(
+    plot.title = element_text(size = 40, hjust = 0.5),
+    legend.box.background = element_rect(colour = "black"),
+    legend.position = 'bottom',
+    legend.title = element_blank(),
+    legend.text = element_text(size = 30, margin = margin(r = 40, unit = "pt")),
+    axis.title = element_text(size = 30),
+    axis.text = element_text(size = 30)
+  )
+ggsave("plots/PCA_Arrows.png", width = 15, height = 15)
 
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~RBP FEATURE PLOT   V
+~ RBP Feature plot with Histogram~
 ```{r}
-rbp_feature_save_path <- paste0('plots/RBP_FEATURE_',Sys.Date())
-dir.create(rbp_feature_save_path)
-
- for (rbp_gene in unique(gene_lists$`Motif genes`))
-{
-   rbp_feature_plot <- feature_plot(cts_normal_cancer,
-                                    min_point_size = 0.2,
-                                    inclusion_level = as.numeric(cts_normal_cancer[rbp_gene,]),
-                                    color_wheel = c("skyblue","#FFFFBF", "#D73027"),
-                                    myTitle = rbp_gene,
-                                    )  +
+rbp_new_dir <- 'RBP_FeaturePlot/'
+for (cell in unique(gene_lists$`Motif genes`))
+ {
+   rbp_feature_plot <- feature_plot3(cts_normal_cancer,
+                                         inclusion_level = as.numeric(log2(cts_normal_cancer[cell,]+1)),
+                                         min_point_size = 0.2,
+                                         myTitle = cell,
+                                         color_wheel = c("skyblue","#FFFFBF", "#D73027"),
+                                         name_t = "Expression level") +
+     guides(fill = guide_colourbar(ticks.colour = "black",
+                                   ticks.linewidth = 1,
+                                   title = expression('Log'['2']~'(counts+1)'))) +
      theme_bw() + 
      theme(plot.title = element_text(size=40, hjust = 0.5),
            legend.position = 'bottom',
@@ -343,13 +957,18 @@ dir.create(rbp_feature_save_path)
            axis.title = element_text(size=30),
            axis.text.x=element_text(size=30),
            axis.text.y=element_text(size=30))
- 
- ggsave(paste0(rbp_feature_save_path,'/',rbp_gene,'.png'),
-         plot = rbp_feature_plot, width = 15, height = 15)
-}
+   
+   hist_file <- paste0('plots/hist/',cell,'.png')
+   my_plot_2 <- ggdraw() + 
+     draw_plot(rbp_feature_plot) +
+     draw_image(hist_file, x = 1, y = 1, hjust = 1, vjust = 1, halign = 1, valign = 1, width = 0.33, height = 0.33)
+
+ggsave(paste0('plots/rbp_feature_hist7/',cell,'.png'),
+         plot = my_plot_2, width = 15, height = 15)
+ }
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~RMATS LISTS V
+~ rMATS lists ~
 ```{r fig.width = 15, fig.height = 15}
 
 rmats_all_lists <- c("rmats_lists/ccRCC_wang_2020_onlyN.txt",
@@ -369,14 +988,14 @@ rmats_c_pt_lists <- c("rmats_lists/ccRCC_wang_2020_Ca_10.txt",
                       "C_PT_SE.MATS.JCEC")
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~RMATS PIPELINE V
+~ rMATS pipeline ~
 ```{r}
 rmats_compariosn_list <-  list(rmats_n_c_lists,
                                rmats_n_pt_lists,
                                rmats_c_pt_lists
                                )
 
-print ("Starting RMATS pipeline")
+print ("Starting rMATS pipeline")
 for (comparison in rmats_compariosn_list){
 print (paste0('Comparison - ', comparison[3]))
 rmats_selected_lists <- comparison
@@ -441,7 +1060,7 @@ rmats_selected_table_name <- rmats_selected_lists[3]
       rmats_events_id[event,rmats_order_selected[sample]] <- samples_inc[sample]}}
   
   #Mark samples used for RMATS in PCA
-   rmats_pca_marked<-rmats_pca_marked<-pca_plot(cts_normal_cancer,
+   rmats_pca_marked<-pca_plot(cts_normal_cancer,
                      groupMeta = meta,
                      meta_type = 0,
                      pc1 =1,
@@ -463,26 +1082,27 @@ rmats_selected_table_name <- rmats_selected_lists[3]
           plot = rmats_pca_marked, width = 15, height = 15)
   }
 ```
-
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~COMBINED RMATS EVENTS    V
+                                    
+~ Combined rMATS events ~
 ```{r}
-# list_rmats_events_path <- c("N_C_SE.MATS.JCEC.txt",
-#                             "N_PT_SE.MATS.JCEC.txt",
-#                             "C_PT_SE.MATS.JCEC.txt")
-# 
-# rmats_events_combined_inc <- NULL
-# 
-# for( i in 1:length(list_rmats_events_path))
-#   rmats_events_combined_inc <- rbind (rmats_events_combined_inc, 
-#                                       read.csv(file =list_rmats_events_path[i], row.names = 1))
-# 
-# rmats_events_combined_inc <- rmats_events_combined_inc[!duplicated(rmats_events_combined_inc$ID), ]
-
+ list_rmats_events_path <- c("N_C_SE.MATS.JCEC.txt",
+                             "N_PT_SE.MATS.JCEC.txt",
+                             "C_PT_SE.MATS.JCEC.txt")
+ 
+ rmats_events_combined_inc <- NULL
+ 
+ for( i in 1:length(list_rmats_events_path))
+   rmats_events_combined_inc <- rbind (rmats_events_combined_inc, 
+                                       read.csv(file =list_rmats_events_path[i], row.names = 1))
+ 
+ rmats_events_combined_inc <- rmats_events_combined_inc[!duplicated(rmats_events_combined_inc$ID), ]
+```
+                                    
+~ rMATS heatmap ~
+```{r}
 for_complexHM <- as.matrix(rmats_events_combined_inc[,meta$Sample.Name])
 for_complexHM <- for_complexHM[apply(for_complexHM, 1, var, na.rm=TRUE) != 0,] # remove genes with no variance
-```
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~RMATS HEATMAP    V
-```{r}
+
 cell_h <- 3
 cell_w <- 1
 plot_name <- 'SKIPPED EXON EVENTS'
@@ -524,9 +1144,9 @@ draw (cHM,heatmap_legend_side = "bottom",annotation_legend_side = "left", legend
 dev.off()
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~DECONVULVE   V
+~ DEconvulve ~
 ```{r}
-##Download the Mature_Full_v3.h5ad fle from Kidneycellatlas, use python note book on it.
+# Download the Mature_Full_v3.h5ad fle from Kidneycellatlas, use python note book on it.
 library(Seurat)
 library(BisqueRNA)
 sc.meta <- read.csv ('data/deconvolution_Mature_full/metadata.csv', row.names = 1)
@@ -546,7 +1166,7 @@ if(!file.exists("Table deconvolution.csv"))
    write.csv(ref.based.estimates, file = "Table deconvolution.csv")
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~CELL TYPE FEATURE    V
+~ Cell Type feature plot ~
 ```{r}
 cnv_hm <- ref.based.estimates
 celltypedir <- 'CELL_PROPORTIONS/'
@@ -578,7 +1198,7 @@ dir.create(celltypedir)
  }
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~TCGA TYPE NORMALIZATION    V
+~ TCGA Type normalization ~ 
 ```{r}
 clinical_kirc <- GDCquery_clinic('TCGA-KIRC')
 clinical_kirc$deceased <- ifelse(clinical_kirc$vital_status == "Alive", FALSE, TRUE)
@@ -617,7 +1237,7 @@ kirc_vsd <- vst(kirc_dds_type,blind = FALSE)
 kirc_matrix_vst <- assay(kirc_vsd)[,kirc_coldata$shortLetterCode == 'TP']
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~RBP KAPLAN-MEIER   V
+~ RBP Kaplan-Meier ~
 ```{r}
 kirc_1gene_all <- kirc_matrix_vst %>%
   as.data.frame() %>%
@@ -675,15 +1295,15 @@ for (kirc_rbp in rbp_in_kirc)
 }
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~RMAPS COMBINED WITH FEATURE AND KM   V
+~ rMAPS combined with feature plot and KM plot
 ```{r}
-rmaps_plots_path <- 'plots/rmaps/RMAPS_COMBINED_2024-02-28/'
+rmaps_plots_path <- 'plots/rmaps/RMAPS_COMBINED/'
 
 rbp_plots_path <- 'plots/rbp_feature_hist/'
 
-km_plots_path <- 'plots/KM/KM_RISK_2024-04-16/'
+km_plots_path <- 'plots/KM/'
 
-save_path_rmaps_feature <- paste0("plots/FI_RMAPS_FEATURE_KM_HIST",Sys.Date(),'/')
+save_path_rmaps_feature <- paste0("plots/RMAPS_FEATURE_KM_HIST",Sys.Date(),'/')
 
 dir.create(save_path_rmaps_feature)
 
@@ -746,24 +1366,23 @@ for (rmaps in names(add_rmaps))
   }
 ```
 
-PASTE 2 PICTURES TOGETHER   V
+~ Paste 2 plots
 ```{r}
-path1 <- 'plots/Sashimi/GGSASHIMI_SUPP/XPA_chr9_-_97682199_97682430_14.png' #sashimi
-path2 <- 'plots/MA_XPA_chr9_-_97682199_124271.png' #feature
-path3 <- 'plots/XPA_14.png'
+path1 <- 'plot1.png' #sashimi
+path2 <- 'plots2.png' #feature
+path3 <- 'plot3.png'
 
 to_plot <- c(path1, path2)
     
 plots <- lapply(to_plot,function(plot_me){
   img <- image_read(plot_me)
-  #img <- (image_annotate(img,'SE', size = 60,location = "+0+30",color = "black"))
   rasterGrob(as.raster(img), interpolate = FALSE)})
     
 ggsave(path3,width=32, height=16,
            marrangeGrob(grobs = plots, ncol=length(to_plot), nrow=1,top=NULL))
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~DESEQ PT-TT    V
+~ DESEQ PT-TT ~
 ```{r fig.width=15, fig.height=15}
 cts_pt_tt <- cts[,meta$Thrombosis == "Yes"]
 meta_pt_tt <- meta[meta$Thrombosis == "Yes", ]
@@ -797,7 +1416,7 @@ pca_thrombosis<-pcaMethods2(dsq_pt_tt,
            groupMeta = meta_pt_tt)
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PAIRS SIMULATION   V
+~ Pairs simulation ~
 ```{r}
  pca_PT_TT <- data.frame(pc1 = pca_thrombosis$data$PC1,
                          pc2 = pca_thrombosis$data$PC2,
@@ -821,7 +1440,7 @@ pmeans[1000] <- mean(sapply (1:n_pairs,
                                                pca_PT_TT[i*2,])))
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~DENSITY PT-TT    V
+~ Density PT-TT ~
 ```{r}
 myhist <- ggplot(as.data.frame(pmeans), aes(x = pmeans)) +
   geom_histogram(aes(y = after_stat(density),colour = 'Simulated'), 
@@ -860,21 +1479,21 @@ myh2 <- myhist +
           axis.text.x=element_text(size=30),
           axis.text.y=element_text(size=30))
 
-ggsave("plots/PCA_PT_TT_HIST1.png", width = 10, height = 10)
+ggsave("plots/PCA_PT_TT_HIST.png", width = 10, height = 10)
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~RBP HISTOGRAM    V
+~ RBP histogram ~
 ```{r}
-x1 <- log2(cts_normal_cancer + 1)#for_complexHM#
-#hist_list <-  unique(gene_lists$`Motif genes`) #rownames(x1) 
+x1 <- log2(cts_normal_cancer + 1)
+hist_list <-  unique(gene_lists$`Motif genes`)
 bw <- 0.1
 for(rbp in hist_list){
   hist_cancer <- data.frame (counts = x1[rbp,patient_state(meta) == 'Cancer'])
   hist_normal <- data.frame (counts = x1[rbp,meta$Normal == 'Yes'])
   hist_thrombus <- data.frame (counts = x1[rbp,meta$Thrombosis == 'Yes'])
-  #rbp_hist <-
-   ggplot() + #ggtitle(paste0(rbp, ' histogram'))+
-     xlab(expression('Log'['2']~'(counts+1)')) + #xlab('Inclusion level') + #
+
+   ggplot() + 
+     xlab(expression('Log'['2']~'(counts+1)')) + 
      ylab('Density') + 
       geom_histogram(data  = hist_cancer, 
                      aes(x = counts, y = after_stat(density),fill = 'Cancer'),
@@ -895,51 +1514,19 @@ for(rbp in hist_list){
                                'Thrombus' =  '#00BFC4'
                                )) + theme_bw() + 
      theme(plot.title = element_text(size=40, hjust = 0.5),
-           #panel.background = element_rect(fill='transparent'),
            plot.background = element_rect(fill='transparent', color=NA),
            legend.position = 'top',
            legend.direction = 'horizontal',
            legend.title = element_text(size=60),
            legend.text = element_text(size=60, hjust = 0.0),
-           #legend.key.width = unit(1, "inches"),
            axis.title = element_text(size=60),
            axis.text.x=element_text(size=60),
            axis.text.y=element_text(size=60))
     
- ggsave(paste0('plots/hist5/',rbp,'.png'), width = 15, height = 15,bg='transparent')}
+ ggsave(paste0('plots/hist/',rbp,'.png'), width = 15, height = 15,bg='transparent')}
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~RBP WITH HIST    V
-```{r}
-for (rbp_gene in unique(gene_lists$`Motif genes`))
-{
-rbp_feature_plot <- feature_plot(cts_normal_cancer,
-                                 min_point_size = 0.2,
-                                 inclusion_level = as.numeric(cts_normal_cancer[rbp_gene,]),
-                                 color_wheel = c("skyblue","#FFFFBF", "#D73027"),
-                                 myTitle = rbp_gene,
-                                 name_t = 'Expression level')  +
-     theme_bw() + 
-     theme(plot.title = element_text(size=40, hjust = 0.5),
-           legend.position = 'bottom',
-           legend.direction = 'horizontal',
-           legend.title = element_text(size=30),
-           legend.text = element_text(size=30, hjust = 0.0),
-           legend.key.width = unit(1, "inches"),
-           axis.title = element_text(size=30),
-           axis.text.x=element_text(size=30),
-           axis.text.y=element_text(size=30))
-
-hist_file <- paste0('plots/hist5/',rbp_gene,'.png')
-my_plot_2 <- ggdraw() + draw_plot(rbp_feature_plot) +
-  draw_image(hist_file, x = 1, y = 1, hjust = 1, vjust = 1, halign = 1, valign = 1, width = 0.33, height = 0.33)
-
-ggsave(paste0('plots/rbp_feature_hist5/',rbp_gene,'.png'),
-         plot = my_plot_2, width = 15, height = 15)
-}
-```
-
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~PCA RMATS CSTAT 0    V
+~ PCA rMATS CSTAT 0 ~
 ```{r, fig.width= 300}
 pca_simple <- pca_plot(na.omit(rmats_events_combined_inc[,colnames(cts_normal_cancer)]),
                      groupMeta = meta[colnames(cts_normal_cancer),],
@@ -962,7 +1549,7 @@ pca_simple3 <- pca_simple +
 ggsave("plots/PCA_RMATS_C0.10.png", width = 15, height = 15,limitsize = FALSE)
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~CORR PLOT   V
+~ Corr plot ~
 ```{r}
 genes<- c('BIRC5','BIRC6')
 State <- factor(patient_state(meta), levels = c('Normal','Cancer', 'Primary Tumor', 'Thrombus Tumor'))
@@ -979,20 +1566,18 @@ for(gene in genes[genes %in% rownames(cts_normal_cancer)]){
     theme(plot.title = element_text(size=40, hjust = 0.5),
         legend.box.background = element_rect(colour = "black"),
         legend.position = 'bottom',
-        #legend.direction = 'horizontal',
         legend.title = element_blank(),
         legend.text = element_text(size=30, margin = margin(r = 40, unit = "pt")),
-        #legend.key.width = unit(1, "inches"),
         axis.title = element_text(size=30),
         axis.text.x=element_text(size=30),
         axis.text.y=element_text(size=30))
 
-ggsave(paste0('plots/cor50_',gene,'.png'), 
+ggsave(paste0('plots/corr_',gene,'.png'), 
          plot = gene_cor_plot, width = 15, height = 15)
 }
 ```
 
-CORR PLOT GENE CELL TYPE    V
+~ Corr plot for cell type ~
 ```{r}
 genes<- c('BIRC5')
 State <- factor(patient_state(meta), levels = c('Normal','Cancer', 'Primary Tumor', 'Thrombus Tumor'))
@@ -1020,17 +1605,19 @@ for(gene in genes[genes %in% rownames(cts_normal_cancer)]){
         axis.text.x=element_text(size=30),
         axis.text.y=element_text(size=30))
 
-ggsave(paste0('plots/cor_pro_prox1_',gene,'.png'), 
+ggsave(paste0('plots/corr_cell_',gene,'.png'), 
          plot = gene_cor_plot, width = 15, height = 15)
 }
 ```
 
-SASHIMI HIST    V
+~ Sashimi histogram ~
 ```{r}
 x1 <- rmats_events_combined_inc
 rownames(x1) <- x1$ID
 
 bw <- 0.025
+
+# hist_list includes evetns of interest
 for(rbp in hist_list){
   hist_cancer <- data.frame (counts = as.numeric(x1[rbp,meta$Sample.Name[patient_state(meta) == 'Cancer']]))
   hist_normal <- data.frame (counts = as.numeric(x1[rbp,meta$Sample.Name[meta$Normal == 'Yes']]))
@@ -1072,70 +1659,7 @@ for(rbp in hist_list){
  ggsave(paste0('plots/hist-prop/',rbp,'.png'), width = 15, height = 15,bg='transparent')}
 ```
 
-CELL TYPE PROPORTIONS REVISED   V
-```{r}
-for (cell in rownames(ref.based.estimates))
- {
-   celltype_feature_plot <- feature_plot2(cts_normal_cancer,
-                                         inclusion_level = as.numeric(cnv_hm[cell,]),
-                                         min_point_size = 0.5,
-                                         myTitle = cell,
-                                         color_wheel = c("skyblue","#FFFFBF", "#D73027"),
-                                         name_t = "Cell Proportions") +
-     guides(fill = guide_colourbar(ticks.colour = "black",
-                                   ticks.linewidth = 1)) +
-     theme_bw() + 
-     theme(plot.title = element_text(size=40, hjust = 0.5),
-           legend.position = 'bottom',
-           legend.direction = 'horizontal',
-           legend.title = element_text(size=30),
-           legend.text = element_text(size=30, hjust = 0.0),
-           legend.key.width = unit(1, "inches"),
-           axis.title = element_text(size=30),
-           axis.text.x=element_text(size=30),
-           axis.text.y=element_text(size=30))
-  
-  ggsave(paste0(celltypedir,cell,'.png'), 
-         plot = celltype_feature_plot, width = 15, height = 15)
- }
-```
-
-RBP EXPRESSION REVISED    V
-```{r}
-rbp_new_dir <- 'RBP_NEW/'
-for (cell in unique(gene_lists$`Motif genes`))
- {
-   rbp_feature_plot <- feature_plot3(cts_normal_cancer,
-                                         inclusion_level = as.numeric(log2(cts_normal_cancer[cell,]+1)),
-                                         min_point_size = 0.2,
-                                         myTitle = cell,
-                                         color_wheel = c("skyblue","#FFFFBF", "#D73027"),
-                                         name_t = "Expression level") +
-     guides(fill = guide_colourbar(ticks.colour = "black",
-                                   ticks.linewidth = 1,
-                                   title = expression('Log'['2']~'(counts+1)'))) +
-     theme_bw() + 
-     theme(plot.title = element_text(size=40, hjust = 0.5),
-           legend.position = 'bottom',
-           legend.direction = 'horizontal',
-           legend.title = element_text(size=30),
-           legend.text = element_text(size=30, hjust = 0.0),
-           legend.key.width = unit(1, "inches"),
-           axis.title = element_text(size=30),
-           axis.text.x=element_text(size=30),
-           axis.text.y=element_text(size=30))
-   
-   hist_file <- paste0('plots/hist5/',cell,'.png')
-   my_plot_2 <- ggdraw() + 
-     draw_plot(rbp_feature_plot) +
-     draw_image(hist_file, x = 1, y = 1, hjust = 1, vjust = 1, halign = 1, valign = 1, width = 0.33, height = 0.33)
-
-ggsave(paste0('plots/rbp_feature_hist7/',cell,'.png'),
-         plot = my_plot_2, width = 15, height = 15)
- }
-```
-
-RMATS EXPRESSION REVISED
+~ rMATS feature plot ~
 ```{r}
 #rmats_events_combined_inc1 <- rmats_events_combined_inc
 #rownames(rmats_events_combined_inc1) <- 1:nrow(rmats_events_combined_inc1)
@@ -1176,50 +1700,7 @@ for (cell in cells)
  }
 ```
 
-RMATS EXPRESSION REVISED2
-```{r}
-#rownames(rmats_events_combined_inc) <- 1:nrow(rmats_events_combined_inc)
-#rmats_new_dir <- 'RMATS_NEW/'
-
-#177413 APOPT1
-#cells <- c(140,167,96,179)
-#c(346,491,545)
-event <- 19653
-samples_inc <- c(eval(parse(text = paste0("c(",asse[event,"IncLevel1"] ,")"))),
-                       eval(parse(text = paste0("c(",asse[event,"IncLevel2"] ,")"))))
-names(samples_inc) <- rmats_order_all
-samples_inc[is.na(samples_inc)] <- mean(samples_inc, na.rm = T)
-
-
-cells <- 'UPP1'
-for (cell in cells)
- {
-   rmats_feature_plot <- feature_plot3(cts_normal_cancer,
-                                         inclusion_level = samples_inc[meta$Sample.Name],
-                                         min_point_size = 0.5,
-                                         myTitle = cells,#rmats_events_combined_inc[cell,'geneSymbol'],
-                                         color_wheel = c("skyblue","#FFFFBF", "#D73027"),
-                                         name_t = "Inclusion level") +
-     guides(fill = guide_colourbar(ticks.colour = "black",
-                                   ticks.linewidth = 1)) +
-     theme_bw() + 
-     theme(plot.title = element_text(size=40, hjust = 0.5),
-           legend.position = 'bottom',
-           legend.direction = 'horizontal',
-           legend.title = element_text(size=30),
-           legend.text = element_text(size=25, hjust = 0.0),
-           legend.key.width = unit(1, "inches"),
-           axis.title = element_text(size=30),
-           axis.text.x=element_text(size=30),
-           axis.text.y=element_text(size=30))
-   # + geom_text(label=colnames(cts_normal_cancer),hjust=0, vjust=0, size = 2)
-  
-  ggsave(paste0('plots/test-',cell,'x.png'), #ggsave(paste0(rmats_new_dir,cell,'.png'), 
-         plot = rmats_feature_plot, width = 15, height = 15)
- }
-```
-
-RMATS WITH HIST   V
+~ rMATS with histogram ~
 ```{r}
 cell <- 'FGFR2'
 cell2 <- 'FGFR2'
@@ -1243,7 +1724,7 @@ cell2 <- 'FGFR2'
            axis.text.x=element_text(size=30),
            axis.text.y=element_text(size=30))
   
-  hist_file <- paste0('plots/Volcano_Venn_Hist_PCA_ANOVA/sashimi-hist/',cell,'.png')
+  hist_file <- paste0('plots/sashimi-hist/',cell,'.png')
   my_plot_2 <- ggdraw() + draw_plot(rmats_feature_plot) +
   draw_image(hist_file, x = 1, y = 1, hjust = 1, vjust = 1, halign = 1, valign = 1, width = 0.33, height = 0.33)
 
@@ -1251,34 +1732,34 @@ ggsave(paste0('plots/test-',cell,'.png'),
        plot = my_plot_2, width = 15, height = 15)
 ```
 
-RMATS EVENTS FOR PLOT   V
+~ rMATS events to plot ~
 ```{r}
-################AS3 CALD1
+#AS3 CALD1
 event <- 4371
 samples_inc <- c(eval(parse(text = paste0("c(",as3[event,"IncLevel1"] ,")"))),
                        eval(parse(text = paste0("c(",as3[event,"IncLevel2"] ,")"))))
 names(samples_inc) <- rmats_order_all
 samples_inc[is.na(samples_inc)] <- mean(samples_inc, na.rm = T)
-################SE ACTN1
+#SE ACTN1
 event <- 45293
 samples_inc <- c(eval(parse(text = paste0("c(",asse[event,"IncLevel1"] ,")"))),
                        eval(parse(text = paste0("c(",asse[event,"IncLevel2"] ,")"))))
 names(samples_inc) <- rmats_order_all
 samples_inc[is.na(samples_inc)] <- mean(samples_inc, na.rm = T)
-################SE CCDC50
+#SE CCDC50
 event <- 220303
 samples_inc <- c(eval(parse(text = paste0("c(",asse[event,"IncLevel1"] ,")"))),
                        eval(parse(text = paste0("c(",asse[event,"IncLevel2"] ,")"))))
 names(samples_inc) <- rmats_order_all
 samples_inc[is.na(samples_inc)] <- mean(samples_inc, na.rm = T)
-################MXE FGFR2
+#MXE FGFR2
 event <- 43735
 samples_inc <- c(eval(parse(text = paste0("c(",as_mxe[event,"IncLevel1"] ,")"))),
                        eval(parse(text = paste0("c(",as_mxe[event,"IncLevel2"] ,")"))))
 names(samples_inc) <- rmats_order_all
 samples_inc[is.na(samples_inc)] <- mean(samples_inc, na.rm = T)
 
-############### NEXT
+# NEXT
 event <- 220303
 samples_inc <- c(eval(parse(text = paste0("c(",r2[event,"IncLevel1"] ,")"))),
                        eval(parse(text = paste0("c(",r2[event,"IncLevel2"] ,")"))))
@@ -1286,9 +1767,9 @@ names(samples_inc) <- rmats_order_all
 samples_inc[is.na(samples_inc)] <- mean(samples_inc, na.rm = T)
 ```
 
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~GENE FEATURE PLOT REVISED
+~ Gene feature plot ~
 ```{r}
-genes<- c('NAIP', 'BIRC2', 'BIRC3', 'BIRC5', 'BIRC6')
+genes <- c('NAIP', 'BIRC2', 'BIRC3', 'BIRC5', 'BIRC6')
 for(gene in genes[genes %in% rownames(cts_normal_cancer)]){
   n <- cts_normal_cancer[gene,meta$Normal == 'Yes']
   c <- cts_normal_cancer[gene,meta$Normal == 'No' & meta$Thrombosis == 'No']
